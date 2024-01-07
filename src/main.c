@@ -1,13 +1,14 @@
+//Copyright (C) 2022-2024 Brian William Denton
+//Available under the GNU GPLv3 License
+
 //#define _XOPEN_SOURCE 500
 //#define _GNU_SOURCE
 //#define _DEFAULT_SOURCE
 
 #include <stdio.h>
-//#include <string.h>
 #include <errno.h>
 #include <stdlib.h>
-//#include <string.h>
-//#include <locale.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -16,20 +17,21 @@
 #include <libssh/server.h>
 #include <libssh/callbacks.h>
 #include <pthread.h>
+#include <pwd.h>
 #include <grp.h>
 
-#define RUN_AS_UID 65534
-#define RUN_AS_GID 65534
-#define RSA_KEY_FILE "/home/brian/ssh_key"
-#define ECDSA_KEY_FILE "/home/brian/ssh_key_ecdsa"
-#define LOG_FILE "/home/brian/st.log"
-#define KEY_EXCHANGE_CONST_STR "rsa-sha2-512,rsa-sha2-256,ssh-rsa"
+#define CONFIG_FILE "/etc/ssh-trap/ssh-trap.conf"
+#define NEWLINE_CHARS "\n\r"
+
+
+#define WHITESPACE_CHARS " \t="
+#define CONFIG_USERNAME "user"
+#define CONFIG_LOGFILE "logfile"
+#define CONFIG_RSAKEYFILE "rsakey"
+#define CONFIG_ECDSAKEYFILE "ecdsakey"
+//#define KEY_EXCHANGE_CONST_STR "rsa-sha2-512,rsa-sha2-256,ssh-rsa"
 #define MAXIPSTRLEN 60
-//#define PASS_FILE "st.pass"
-//#define USER_FILE "st.user"
-/* #define MAX_LINUX_SENDFILE 0x7ffff000 */
-/* #define DENT_BUF_SIZE 512 */
-/* #define MY_MAX_PATH 1024 */
+
 struct thissess
 {
 	char ipstr[MAXIPSTRLEN];
@@ -40,14 +42,11 @@ struct thissess
 int logfd;
 const int ssopt = 1;
 
-//struct ssh_server_callbacks_struct cb = {.userdata = NULL, .auth_password_function = a
-//char path[MY_MAX_PATH] = {0};
-
-/* void printusage() */
-/* { */
-/* 	puts("Usage:\n\tbcp source-directory target-directory\n\tcopies source-directory into target-directory\n\tdoesn't overwrite files that already exist"); */
-/* 	return; */
-/* } */
+uid_t runasuid;
+gid_t runasgid;
+char *logfilepath = NULL;
+char *rsakeyfile = NULL;
+char *ecdsakeyfile = NULL;
 
 static inline void getipstring(struct sockaddr_storage *s, char *ipstring, uint16_t *port)
 {
@@ -105,18 +104,6 @@ static inline void logipcreds(const struct thissess *c, const char *user, const 
 
 	dprintf(logfd, "[%i-%02i-%02i %02i:%02i:%02i.%03li] - [%s %hu] - login attempt %lu \"%s\" \"%s\"\n", tmcurtime.tm_year + 1900, tmcurtime.tm_mon + 1, tmcurtime.tm_mday, tmcurtime.tm_hour, tmcurtime.tm_min, tmcurtime.tm_sec, curtime.tv_nsec/1000000, c->ipstr, c->port, c->attempt, user, pass);
 }
-
-/* int passfunc(ssh_session ssess, const char *user, const char *pass, void *ud) */
-/* { */
-/* 	struct thissess *ts; */
-
-/* 	(void) ssess; */
-/* 	ts = ud; */
-
-/* 	ts->attempt++; */
-/* 	logipcreds(ts, user, pass); */
-/* 	return SSH_AUTH_DENIED; */
-/* } */
 
 void *conhandler(void *arg)
 {
@@ -199,47 +186,223 @@ void *conhandler(void *arg)
 	return NULL;
 }
 
-/* static inline unsigned processfile(char *file) */
-/* { */
-	
-/* } */
+static inline void loadconfig()
+{
+	int myerrno;
+	int cfd;
+	struct stat fst;
+	struct passwd *u;
+	char *finram;
+	char *cursor;
+	char *curline;
+	char *curtok;
+	char *toka;
+	char *tokb;
+	unsigned char founduser=0;
+
+	cfd = open(CONFIG_FILE, O_RDONLY, 0);
+	if (cfd == -1)
+	{
+		myerrno = errno;
+		logmsg("config file failed open()");
+		logmsg(strerror(myerrno));
+		exit(myerrno);
+	}
+	if (fstat(cfd, &fst) == -1)
+	{
+		myerrno = errno;
+		logmsg("config file failed fstat()");
+		logmsg(strerror(myerrno));
+		exit(myerrno);
+	}
+	finram = malloc(1 + fst.st_size);//+1 for null
+	if (!finram)
+	{
+		myerrno = errno;
+		logmsg("config file parse failed malloc()");
+		logmsg(strerror(myerrno));
+		exit(myerrno);
+	}
+	if (read(cfd, finram, fst.st_size) != fst.st_size)
+	{
+		myerrno = errno;
+		logmsg("config file parse failed read()");
+		logmsg(strerror(myerrno));
+		exit(myerrno);
+	}
+	close(cfd);
+	finram[fst.st_size] = 0;//null the end
+
+	cursor = finram;
+	while (cursor)
+	{
+		curline = strsep(&cursor, NEWLINE_CHARS);
+		curtok = __builtin_strchr(curline, '#');
+		if (curtok)
+		{
+			*curtok = 0;
+		}
+		if (!__builtin_strlen(curline))
+		{
+			continue;
+		}
+		
+		curtok = curline;
+		while (curtok)
+		{
+			toka = strsep(&curtok, WHITESPACE_CHARS);
+			if (__builtin_strlen(toka))
+			{
+				break;
+			}
+		}
+		if (!curtok)
+		{
+			logmsg("bad line in config file (debug info: no token a or only a)");
+			exit(1);
+		}
+		while (curtok)
+		{
+			tokb = strsep(&curtok, WHITESPACE_CHARS);
+			if (__builtin_strlen(tokb))
+			{
+				break;
+			}
+		}
+		if (!__builtin_strlen(tokb))
+		{
+			logmsg("bad line in config file (debug info: no token b)");
+			exit(1);
+		}
+		if (!__builtin_strcmp(CONFIG_USERNAME, toka))
+		{
+			//username
+			if (founduser)
+			{
+				logmsg("config file parse error MULTIPLE USER DEFINITIONS!");
+				exit(1);
+			}
+			errno = 0;
+			u = getpwnam(tokb);
+			if (!u)
+			{
+				myerrno = errno;
+				logmsg("config file parse failed getpwnam()");
+				logmsg(strerror(myerrno));
+				if (myerrno)
+				{
+					exit(myerrno);
+				}
+				exit(1);
+			}
+			runasuid = u->pw_uid;
+			runasgid = u->pw_gid;
+			founduser = 1;
+		}
+		else if (!__builtin_strcmp(CONFIG_LOGFILE, toka))
+		{
+			//log file
+			if (logfilepath)
+			{
+				logmsg("config file parse error MULTIPLE LOGFILE DEFINITIONS!");
+				exit(1);
+			}
+			logfilepath = strdup(tokb);
+			if (!logfilepath)
+			{
+				myerrno = errno;
+				logmsg("config file parse failed (token b) strdup()");
+				logmsg(strerror(myerrno));
+				exit(myerrno);
+			}
+		}
+		else if (!__builtin_strcmp(CONFIG_RSAKEYFILE, toka))
+		{
+			//rsa key
+			if (rsakeyfile)
+			{
+				logmsg("config file parse error MULTIPLE RSA KEYFILE DEFINITIONS!");
+				exit(1);
+			}
+			rsakeyfile = strdup(tokb);
+			if (!rsakeyfile)
+			{
+				myerrno = errno;
+				logmsg("config file parse failed (token b) strdup()");
+				logmsg(strerror(myerrno));
+				exit(myerrno);
+			}
+		}
+		else if (!__builtin_strcmp(CONFIG_ECDSAKEYFILE, toka))
+		{
+			//ecdsa key
+			if (ecdsakeyfile)
+			{
+				logmsg("config file parse error MULTIPLE ECDSA KEYFILE DEFINITIONS!");
+				exit(1);
+			}
+			ecdsakeyfile = strdup(tokb);
+			if (!rsakeyfile)
+			{
+				myerrno = errno;
+				logmsg("config file parse failed (token b) strdup()");
+				logmsg(strerror(myerrno));
+				exit(myerrno);
+			}
+		}
+	}
+	if (!(founduser && logfilepath && rsakeyfile && ecdsakeyfile))
+	{
+		logmsg("config file parse failed, missing definition. Verify all are present: user, logfile, rsakey, ecdsakey");
+		exit(1);
+	}
+
+	free(finram);
+}
 
 int main(int argc, char *argv[])
 {
+	int myerrno;
 	pthread_attr_t pattr;
 	ssh_bind sbind;
 	ssh_session ssess;
-	int pcreateretval;
 	pthread_t nt;
 
 	(void) argc;
 	(void) argv;
 
-	logfd = open(LOG_FILE, O_WRONLY | O_CREAT, 0644);
+	logfd = STDERR_FILENO;
+
+	loadconfig();
+
+	logfd = open(logfilepath, O_WRONLY | O_CREAT, 0644);
 	if (logfd == -1)
 	{
-		//perror("open() log file");
-		return 1;
+		myerrno = errno;
+		perror("log file open()");
+		return myerrno;
 	}
 	if (lseek(logfd, 0, SEEK_END) == -1)
 	{
-		//perror("lseek() log file");
-		return 1;
+		myerrno = errno;
+		perror("log file lseek()");
+		return myerrno;
 	}
 	
 	logmsg("starting up");
 
+
 	sbind = ssh_bind_new();
 
-	if (ssh_bind_options_set(sbind, SSH_BIND_OPTIONS_RSAKEY, RSA_KEY_FILE) < 0)
+	if (ssh_bind_options_set(sbind, SSH_BIND_OPTIONS_RSAKEY, rsakeyfile) < 0)
 	{
 		logmsg("failed to ssh_bind_options_set() RSAKEY");
 		return 1;
 	}
 
-	if (ssh_bind_options_set(sbind, SSH_BIND_OPTIONS_ECDSAKEY, ECDSA_KEY_FILE) < 0)
+	if (ssh_bind_options_set(sbind, SSH_BIND_OPTIONS_ECDSAKEY, ecdsakeyfile) < 0)
 	{
-		logmsg("failed to ssh_bind_options_set() RSAKEY");
+		logmsg("failed to ssh_bind_options_set() ECDSAKEY");
 		return 1;
 	}
 
@@ -252,37 +415,43 @@ int main(int argc, char *argv[])
 
 	if (setgroups(0, NULL) != 0)
 	{
+		myerrno = errno;
 		logmsg("setgroups() failed");
-		return 1;
+		logmsg(strerror(myerrno));
+		return myerrno;
 	}
-	if (setgid(RUN_AS_GID))
+	if (setgid(runasgid))
 	{
-		//perror("setgid()");
+		myerrno = errno;
 		logmsg("failed to setgid()");
-		return 1;
+		logmsg(strerror(myerrno));
+		return myerrno;
 	}
-	if (getgid() != RUN_AS_GID)
+	if (getgid() != runasgid)
 	{
 		logmsg("getgid() returned an unexpected result");
 		return 1;
 	}
-	if (setuid(RUN_AS_UID))
+	if (setuid(runasuid))
 	{
-		//perror("setuid()");
+		myerrno = errno;
 		logmsg("failed to setuid()");
-		return 1;
+		logmsg(strerror(myerrno));
+		return myerrno;
 	}
-	if (getuid() != RUN_AS_UID)
+	if (getuid() != runasuid)
 	{
 		logmsg("getuid() returned an unexpected result");
 		return 1;
 	}
 
 	pthread_attr_init(&pattr);
-	if (pthread_attr_setdetachstate(&pattr, PTHREAD_CREATE_DETACHED))
+	myerrno = pthread_attr_setdetachstate(&pattr, PTHREAD_CREATE_DETACHED);
+	if (myerrno)
 	{
-		logmsg("pthread_attr_setdetachstate() failed");
-		return 1;
+		logmsg("failed pthread_attr_setdetachstate()");
+		logmsg(strerror(myerrno));
+		return myerrno;
 	}
 
 	logmsg("startup complete, entering accept loop");
@@ -298,14 +467,15 @@ int main(int argc, char *argv[])
 		}
 		do
 		{
-			pcreateretval = pthread_create(&nt, &pattr, conhandler, ssess);
-			if ((pcreateretval) && (pcreateretval != EAGAIN))
+			myerrno = pthread_create(&nt, &pattr, conhandler, ssess);
+			if ((myerrno) && (myerrno != EAGAIN))
 			{
-				logmsg("pthread_create() failed");
-				return 1;
+				logmsg("failed pthread_create()");
+				logmsg(strerror(myerrno));
+				return myerrno;
 			}
 		}
-		while (pcreateretval);
+		while (myerrno);
 	}
 	return 0;
 }
