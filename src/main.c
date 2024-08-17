@@ -15,6 +15,7 @@ int ssoptkidle = -1;
 #include <errno.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -30,6 +31,9 @@ int ssoptkidle = -1;
 #define CONFIG_FILE "/etc/ssh-trap/ssh-trap.conf"
 #define NEWLINE_CHARS "\n\r"
 
+
+#define NEW_NOFILE_NUM 1048576
+const struct rlimit newnofile = {NEW_NOFILE_NUM, NEW_NOFILE_NUM};
 
 #define WHITESPACE_CHARS " \t="
 #define CONFIG_USERNAME "user"
@@ -528,6 +532,14 @@ int main(int argc, char *argv[])
 		logmsg("failed to ssh_bind_listen()");
 		logmsg(ssh_get_error(sbind));
 		return 1;
+	}
+
+	if (setrlimit(RLIMIT_NOFILE, &newnofile))
+	{
+		myerrno = errno;
+		logmsg("failed to setrlimit()");
+		logmsg(strerror(myerrno));
+		return myerrno;
 	}
 
 	if (setgroups(0, NULL) != 0)
