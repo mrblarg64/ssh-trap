@@ -5,6 +5,12 @@
 //#define _GNU_SOURCE
 //#define _DEFAULT_SOURCE
 
+#define SSHTRAP_SET_KEEPIDLE
+#ifdef SSHTRAP_SET_KEEPIDLE
+#include <netinet/tcp.h>
+int ssoptkidle = -1;
+#endif
+
 #include <stdio.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -13,6 +19,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <arpa/inet.h>
+#include <netinet/ip.h>
 #include <libssh/libssh.h>
 #include <libssh/server.h>
 #include <libssh/callbacks.h>
@@ -29,6 +36,9 @@
 #define CONFIG_LOGFILE "logfile"
 #define CONFIG_RSAKEYFILE "rsakey"
 #define CONFIG_ECDSAKEYFILE "ecdsakey"
+#ifdef SSHTRAP_SET_KEEPIDLE
+#define CONFIG_TCPKEEPIDLE "tcpkeepidle"
+#endif
 //#define KEY_EXCHANGE_CONST_STR "rsa-sha2-512,rsa-sha2-256,ssh-rsa"
 #define MAXIPSTRLEN 60
 
@@ -40,7 +50,6 @@ struct thissess
 };
 
 int logfd;
-const int ssopt = 1;
 
 uid_t runasuid;
 gid_t runasgid;
@@ -133,13 +142,7 @@ void *conhandler(void *arg)
 
 	logmsgip("new connection", &ts);
 
-	if (setsockopt(curclifd, SOL_SOCKET, SO_KEEPALIVE, &ssopt, sizeof(int)) == -1)
-	{
-		logmsgip("setsockopt() failed, continuing...", &ts);
-	}
-
 	ts.attempt = 0;
-
 
 	if (ssh_handle_key_exchange(ssess))
 	{
@@ -199,6 +202,10 @@ static inline void loadconfig()
 	char *toka;
 	char *tokb;
 	unsigned char founduser=0;
+	#ifdef SSHTRAP_SET_KEEPIDLE
+	char *endptr;
+	unsigned char foundkeepidle=0;
+	#endif
 
 	cfd = open(CONFIG_FILE, O_RDONLY, 0);
 	if (cfd == -1)
@@ -288,11 +295,12 @@ static inline void loadconfig()
 			{
 				myerrno = errno;
 				logmsg("config file parse failed getpwnam()");
-				logmsg(strerror(myerrno));
 				if (myerrno)
 				{
+					logmsg(strerror(myerrno));
 					exit(myerrno);
 				}
+				logmsg("user probably does not exist");
 				exit(1);
 			}
 			runasuid = u->pw_uid;
@@ -350,6 +358,34 @@ static inline void loadconfig()
 				exit(myerrno);
 			}
 		}
+		#ifdef SSHTRAP_SET_KEEPIDLE
+		else if (!__builtin_strcmp(CONFIG_TCPKEEPIDLE, toka))
+		{
+			if (foundkeepidle)
+			{
+				logmsg("config file parse error MULTIPLE TCPKEEPIDLE DEFINITIONS!");
+				exit(1);
+			}
+			ssoptkidle = strtoumax(tokb, &endptr, 10);
+			if ((*endptr) || (!ssoptkidle) || (ssoptkidle == ((int)UINTMAX_MAX)))
+			{
+				if (errno)
+				{
+					myerrno = errno;
+					logmsg("config file parse failed strtoimax()");
+					logmsg(strerror(myerrno));
+					exit(myerrno);
+				}
+				logmsg("invalid tcpkeepidle time");
+				exit(1);
+			}
+		}
+		#endif
+		else
+		{
+			logmsg("encountered unknown line in config file, check that compile time support for options you want were enabled");
+			exit(EINVAL);
+		}
 	}
 	if (!(founduser && logfilepath && rsakeyfile && ecdsakeyfile))
 	{
@@ -367,6 +403,9 @@ int main(int argc, char *argv[])
 	ssh_bind sbind;
 	ssh_session ssess;
 	pthread_t nt;
+	int sock;
+	struct sockaddr_storage listener;
+	int ssopt;
 
 	(void) argc;
 	(void) argv;
@@ -375,19 +414,14 @@ int main(int argc, char *argv[])
 
 	loadconfig();
 
-	logfd = open(logfilepath, O_WRONLY | O_CREAT, 0644);
+	logfd = open(logfilepath, O_WRONLY | O_CREAT | O_APPEND, 0644);
 	if (logfd == -1)
 	{
 		myerrno = errno;
 		perror("log file open()");
 		return myerrno;
 	}
-	if (lseek(logfd, 0, SEEK_END) == -1)
-	{
-		myerrno = errno;
-		perror("log file lseek()");
-		return myerrno;
-	}
+	free(logfilepath);
 	
 	logmsg("starting up");
 
@@ -399,12 +433,89 @@ int main(int argc, char *argv[])
 		logmsg("failed to ssh_bind_options_set() RSAKEY");
 		return 1;
 	}
+	free(rsakeyfile);
 
 	if (ssh_bind_options_set(sbind, SSH_BIND_OPTIONS_ECDSAKEY, ecdsakeyfile) < 0)
 	{
 		logmsg("failed to ssh_bind_options_set() ECDSAKEY");
 		return 1;
 	}
+	free(ecdsakeyfile);
+
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock == -1)
+	{
+		myerrno = errno;
+		logmsg("failed to socket()");
+		logmsg(strerror(myerrno));
+		return myerrno;
+	}
+
+	//on linux-6.5.5. these are inhereted after accept()
+	//also the kernel's broken rt_tos2priority() function will
+	//be fine with the IPTOS_DSCP_LE so there is no need
+	//to setsockopt(SO_PRIORITY)
+	ssopt = 1;
+	if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &ssopt, sizeof(int)) == -1)
+	{
+		myerrno = errno;
+		logmsg("SO_KEEPALIVE setsockopt() failed");
+		logmsg(strerror(myerrno));
+		return myerrno;
+	}
+	ssopt = IPTOS_DSCP_LE;
+	if (setsockopt(sock, IPPROTO_IP, IP_TOS, &ssopt, sizeof(int)) == -1)
+	{
+		myerrno = errno;
+		logmsg("IP_TOS (DSCP) setsockopt() failed");
+		logmsg(strerror(myerrno));
+		return myerrno;
+	}
+	#ifdef SSHTRAP_SET_KEEPIDLE
+	if (ssoptkidle != -1)
+	{
+		if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &ssoptkidle, sizeof(int)) == -1)
+		{
+			myerrno = errno;
+			logmsg("TCP_KEEPIDLE setsockopt() failed");
+			logmsg(strerror(myerrno));
+			return myerrno;
+		}
+	}
+	#endif
+	ssopt = 1;
+	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &ssopt, sizeof(int)) == -1)
+	{
+		myerrno = errno;
+		logmsg("SO_REUSEADDR setsockopt() failed");
+		logmsg(strerror(myerrno));
+		return myerrno;
+	}
+
+		__builtin_memset(&listener, 0, sizeof(listener));
+	((struct sockaddr_in*)&listener)->sin_family = AF_INET;
+	((struct sockaddr_in*)&listener)->sin_addr.s_addr = 0;
+	#ifdef __ORDER_LITTLE_ENDIAN__
+	((struct sockaddr_in*)&listener)->sin_port = __builtin_bswap16(22);
+	#else
+	((struct sockaddr_in*)&listener)->sin_port = 22;
+	#endif
+
+	if (bind(sock, (struct sockaddr*) &listener, sizeof(struct sockaddr_storage)) == -1)
+	{
+		myerrno = errno;
+		perror("bind()");
+		return myerrno;
+	}
+
+	if (listen(sock, 1024) == -1)
+	{
+		myerrno = errno;
+		perror("listen()");
+		return myerrno;
+	}
+
+	ssh_bind_set_fd(sbind, sock);
 
 	if (ssh_bind_listen(sbind) < 0)
 	{

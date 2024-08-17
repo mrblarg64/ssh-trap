@@ -14,8 +14,8 @@ all: ssh-trap
 ssh-trap: $(OBJS)
 	$(CC) $(OBJS) -o ssh-trap $(LDFLAGS)
 
-OBJS: $(SRCS)
-	$(CC) $(CFLAGS) -c -o $@ $(SRCS)
+#OBJS: $(SRCS)
+#	$(CC) $(CFLAGS) -c -o $@ $(SRCS)
 
 clean:
 	$(RM) ssh-trap src/*.o
