@@ -454,7 +454,7 @@ int main(int argc, char *argv[])
 	//on linux-6.5.5. these are inhereted after accept()
 	//also the kernel's broken rt_tos2priority() function will
 	//be fine with the IPTOS_DSCP_LE so there is no need
-	//to setsockopt(SO_PRIORITY)
+	//to setsockopt(SO_PRIORITY) (btw priority IS NOT inhereted)
 	ssopt = 1;
 	if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &ssopt, sizeof(int)) == -1)
 	{
@@ -517,6 +517,12 @@ int main(int argc, char *argv[])
 
 	ssh_bind_set_fd(sbind, sock);
 
+	//if you look at the source for ssh_bind_listen()
+	//you'll see that it doesn't bind() or listen()
+	//if the fd is valid
+	//but it does pull in the necessary key files
+	//so we do this here before we change uid
+	//(while we still have access to the keys)
 	if (ssh_bind_listen(sbind) < 0)
 	{
 		logmsg("failed to ssh_bind_listen()");
