@@ -354,7 +354,7 @@ static inline void loadconfig()
 				exit(1);
 			}
 			ecdsakeyfile = strdup(tokb);
-			if (!rsakeyfile)
+			if (!ecdsakeyfile)
 			{
 				myerrno = errno;
 				logmsg("config file parse failed (token b) strdup()");
